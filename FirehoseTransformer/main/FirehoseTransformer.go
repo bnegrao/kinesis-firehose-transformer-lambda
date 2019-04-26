@@ -3,10 +3,8 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
-	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 
 	"github.com/aws/aws-lambda-go/events"
 
@@ -27,69 +25,48 @@ func handler(evnt events.KinesisFirehoseEvent) (events.KinesisFirehoseResponse, 
 	for _, record := range evnt.Records {
 		fmt.Printf("Processando record de id: %s\n", record.RecordID)
 
-		transformedRecord, err := buildResponseRecord(record)
+		var responseRecord events.KinesisFirehoseResponseRecord
+
+		processedData, err := process(record.Data)
 		if err != nil {
-			log.Fatalln(err)
+			fmt.Printf("ERROR: The event record of id %s could not be processed. The error was: %s\n", record.RecordID, err)
+			responseRecord = buildResponseRecord(record.RecordID, events.KinesisFirehoseTransformedStateProcessingFailed, record.Data)
+		} else {
+			responseRecord = buildResponseRecord(record.RecordID, events.KinesisFirehoseTransformedStateOk, processedData)
 		}
 
-		response.Records = append(response.Records, transformedRecord)
+		response.Records = append(response.Records, responseRecord)
 	}
-
-	fmt.Printf("%+v\n", response)
 
 	return response, nil
 }
 
-func buildResponseRecord(record events.KinesisFirehoseEventRecord) (events.KinesisFirehoseResponseRecord, error) {
-	var transformedRecord events.KinesisFirehoseResponseRecord
-
-	data, err := transform(record.Data)
-	if err != nil {
-		return transformedRecord, err
+func buildResponseRecord(recordId string, transformedState string, data []byte) events.KinesisFirehoseResponseRecord {
+	transformedRecord := events.KinesisFirehoseResponseRecord{
+		RecordID: recordId,
+		Result:   transformedState,
+		Data:     data,
 	}
 
-	transformedRecord.RecordID = record.RecordID
-	transformedRecord.Result = events.KinesisFirehoseTransformedStateOk
-	transformedRecord.Data = []byte(string(data))
-
-	return transformedRecord, nil
+	return transformedRecord
 }
 
-func transform(dataBytes []byte) ([]byte, error) {
+func process(dataBytes []byte) ([]byte, error) {
+	// IOT added a '\n' to the end of the data payload. We need to remove
+	// that newline before decompressing. The '\n' is the last byte in the payload
+	var dataBytesWithoutNewline []byte = dataBytes[0 : len(dataBytes)-1]
 
-	decompressedMessage, err := decompress1(dataBytes)
+	decompressedMessage, err := decompress(dataBytesWithoutNewline)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Failed to decompress the message, error: %s", err)
 	}
 
 	fmt.Printf("decompressed message:\n%s\n", string(decompressedMessage))
 
-	var pdvEvent map[string]interface{}
-	err = json.Unmarshal(decompressedMessage, &pdvEvent)
-	if err != nil {
-		return nil, err
-	}
-
-	validationError := validate(pdvEvent)
-	if len(validationError) > 0 {
-		pdvEvent["ingesterValidationError"] = validationError
-	}
-
-	result, err := json.Marshal(pdvEvent)
-	return result, err
+	return decompressedMessage, err
 }
 
-// validate retorna um erro de validação
-// em caso de mensagem valida a string retornada será vazia
-func validate(pdvEvent map[string]interface{}) string {
-	if _, contains := pdvEvent["eventType"]; contains {
-		return ""
-	} else {
-		return "O json não contém o elemento de nome 'eventType'."
-	}
-}
-
-func decompress1(message []byte) ([]byte, error) {
+func decompress(message []byte) ([]byte, error) {
 
 	buffer := bytes.NewBuffer(message)
 	reader, err := gzip.NewReader(buffer)
